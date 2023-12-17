@@ -13,12 +13,12 @@
 
 import time
 
-from dlrover.python.elastic_agent.master_client import GlobalMasterClient
+from dlrover.python.elastic_agent.master_client import MasterClient
 
 
 class SyncClient(object):
     def __init__(self):
-        self._master_client = GlobalMasterClient.MASTER_CLIENT
+        self._master_client = MasterClient.singleton_instance()
 
     def join_sync(self, sync_name):
         """Join a synchronizationg group."""
@@ -38,9 +38,9 @@ class SyncClient(object):
             True if sync successfully. False if timeout.
         """
         while True:
-            res = self._master_client.sync_finished(sync_name)
-            if res.success:
-                return res.success
+            success = self._master_client.sync_finished(sync_name)
+            if success:
+                return success
             time.sleep(1)
             if timeout > 0:
                 timeout -= 1
@@ -55,9 +55,9 @@ class SyncClient(object):
             timeout: if not None, timeout in seconds if notify=False
         """
         while True:
-            res = self._master_client.barrier(barrier_name)
-            if res.success:
-                return res.success
+            success = self._master_client.barrier(barrier_name)
+            if success:
+                return success
             time.sleep(1)
             if timeout > 0:
                 timeout -= 1

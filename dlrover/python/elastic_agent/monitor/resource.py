@@ -19,10 +19,10 @@ import psutil
 import pynvml
 
 from dlrover.python.common.constants import NodeEnv
+from dlrover.python.common.grpc import GPUStats
 from dlrover.python.common.log import default_logger as logger
 from dlrover.python.common.singleton import singleton
-from dlrover.python.elastic_agent.master_client import GlobalMasterClient
-from dlrover.python.elastic_agent.monitor.metrics import GPUMetric
+from dlrover.python.elastic_agent.master_client import MasterClient
 
 
 def get_process_cpu_percent():
@@ -58,9 +58,13 @@ def get_used_memory():
 def get_gpu_stats(gpus=[]):
     """ "Get the used gpu info of the container"""
     if not gpus:
-        device_count = pynvml.nvmlDeviceGetCount()
+        try:
+            device_count = pynvml.nvmlDeviceGetCount()
+        except Exception:
+            logger.warning("No GPU is available.")
+            device_count = 0
         gpus = list(range(device_count))
-    gpu_stats: list[GPUMetric] = []
+    gpu_stats: list[GPUStats] = []
     for i in gpus:
         handle = pynvml.nvmlDeviceGetHandleByIndex(i)
         memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
@@ -72,7 +76,7 @@ def get_gpu_stats(gpus=[]):
         gpu_utilization = utilization.gpu
 
         gpu_stats.append(
-            GPUMetric(
+            GPUStats(
                 index=i,
                 total_memory_mb=total_memory,
                 used_memory_mb=used_memory,
@@ -91,13 +95,11 @@ class ResourceMonitor(object):
         """
         self._total_cpu = psutil.cpu_count(logical=True)
         self._gpu_enabled = False
-        self._gpu_stats: list[GPUMetric] = []
+        self._gpu_stats: list[GPUStats] = []
+        self._master_client = MasterClient.singleton_instance()
 
     def start(self):
-        if (
-            not os.getenv(NodeEnv.DLROVER_MASTER_ADDR, "")
-            or not os.getenv(NodeEnv.AUTO_MONITOR_WORKLOAD, "") == "true"
-        ):
+        if not os.getenv(NodeEnv.DLROVER_MASTER_ADDR, ""):
             return
 
         self.init_gpu_monitor()
@@ -134,22 +136,18 @@ class ResourceMonitor(object):
                 "NVIDIA NVML library not found. "
                 "GPU monitoring features will be disabled."
             )
-        except pynvml.NVMLError as e:
+        except pynvml.NVMLError_Unknown as e:
             logger.error(
-                f"An error occurred while initializing NVIDIA NVML: {e}"
+                f"An unknown error occurred during NVML initializing: {e}"
             )
         except Exception as e:
             logger.exception(
-                f"An unexpected error occurred during NVML shutdown: {e}"
+                f"An unexpected error occurred during NVML initializing: {e}"
             )
 
     def shutdown_gpu_monitor(self):
         try:
             pynvml.nvmlShutdown()
-        except pynvml.NVMLError as e:
-            logger.error(
-                f"An error occurred while shutting down NVIDIA NVML: {e}"
-            )
         except Exception as e:
             logger.exception(
                 f"An unexpected error occurred during NVML shutdown: {e}"
@@ -165,10 +163,10 @@ class ResourceMonitor(object):
             if self._gpu_enabled:
                 self._gpu_stats = get_gpu_stats()
             current_cpu = round(cpu_percent * self._total_cpu, 2)
-            GlobalMasterClient.MASTER_CLIENT.report_used_resource(
+            self._master_client.report_used_resource(
                 used_mem, current_cpu, self._gpu_stats
             )
-            logger.info(
+            logger.debug(
                 "Report Resource CPU : %s, Memory %s, GPU %s",
                 current_cpu,
                 used_mem,

@@ -38,6 +38,7 @@ class AnalyserConstants(object):
     TIMELINE_SIGNAL_FILE_NAME = "aprof.done"
     PROF_SIGNAL_FILE_NAME = "aprof_txt.done"
     GPU_UTILIZATION = "gpu_utility"
+    HFU = "hfu"
 
 
 class AutoAccelerateExtraArgs(Enum):
@@ -45,6 +46,7 @@ class AutoAccelerateExtraArgs(Enum):
     SAMPLE_BATCH = "sample_batch"
     BATCH_SIZE = "batch_size"  # total batch size. Equals to batch_size_per_process * ddp_size
     EXPAND_SAMPLE_BATCH = "expand_sample_batch"  # whether to expand sample batch
+    SAMPLER_SEED = "sampler_seed"
 
     @classmethod
     def all(cls):
@@ -62,13 +64,44 @@ class DataConstants(object):
 class GPUCapability:
     """
     TFLOPS of GPU
+    references:
+    https://resources.nvidia.com/en-us-tensor-core
+    https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf
     """
 
     TFLOPS = {
-        "FP16": {"NVIDIA A100-SXM4-80GB": 312, "Tesla V100-SXM2-32GB": 125},
-        "FP32": {"NVIDIA A100-SXM4-80GB": 19.5, "Tesla V100-SXM2-32GB": 15.7},
+        "FP8": {"NVIDIA H100 80GB HBM3": 1978.9, "NVIDIA H800": 1978.9},
+        "FP16": {
+            "Tesla V100-SXM2-32GB": 125,
+            "NVIDIA A100-SXM4-80GB": 312,
+            "NVIDIA A800-SXM4-80GB": 312,
+            "NVIDIA H100 80GB HBM3": 989.4,
+            "NVIDIA H800": 989.4,
+        },
+        "BF16": {
+            "NVIDIA A100-SXM4-80GB": 312,
+            "NVIDIA A800-SXM4-80GB": 312,
+            "NVIDIA H100 80GB HBM3": 989.4,
+            "NVIDIA H800": 989.4,
+        },
+        "FP32": {
+            "Tesla V100-SXM2-32GB": 15.7,
+            "NVIDIA A100-SXM4-80GB": 19.5,
+            "NVIDIA A800-SXM4-80GB": 19.5,
+            "NVIDIA H100 80GB HBM3": 66.9,
+            "NVIDIA H800": 66.9,
+        },
     }
 
 
 class MediaBase:
     MEDIABASE_PREFIX = "mediabase://"
+
+
+class TrainInfo:
+    """
+    The set of possible argument name.
+    """
+
+    DATASETS = ["train.*data.*", "data.*path.*", "data.*dir.*"]
+    MODEL_PATH = ["output.*dir.*", "output.*path.*"]

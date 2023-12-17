@@ -1,4 +1,4 @@
-# Copyright 2022 The EasyDL Authors. All rights reserved.
+# Copyright 2022 The DLRover Authors. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -61,13 +61,20 @@ class JobAutoScalerTest(unittest.TestCase):
             6, NodeResource(4, 4096)
         )
         plan.node_resources["test-edljob-worker-0"] = NodeResource(8, 8192)
+        plan.node_resources["test-edljob-worker-1"] = NodeResource(8, 8192)
         plan.node_resources["test-edljob-ps-1"] = NodeResource(8, 8192)
         auto_scaler._ps_manager._nodes[1].status = NodeStatus.RUNNING
+        auto_scaler._worker_manager._nodes[0].critical = True
         scale_plan = auto_scaler.execute_job_optimization_plan(plan)
         self.assertEqual(len(manager._ps_manager._nodes), 4)
         self.assertEqual(len(manager._worker_manager._nodes), 7)
         self.assertEqual(len(scale_plan.remove_nodes), 1)
         self.assertEqual(len(scale_plan.launch_nodes), 5)
+        remove_node = scale_plan.remove_nodes[0]
+        self.assertTrue(remove_node.migrated)
+        self.assertTrue(remove_node.is_released)
+        self.assertFalse(remove_node.relaunchable)
+        self.assertEqual(remove_node.name, "test-edljob-worker-1")
 
         ps_addrs = []
         for i in [0, 3, 2]:

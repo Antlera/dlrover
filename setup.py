@@ -19,6 +19,7 @@ install_requires = [
     "psutil",
     "pynvml",
     "urllib3<1.27,>=1.21.1",
+    "deprecated",
 ]
 
 
@@ -55,6 +56,7 @@ setup(
             "proto/*",
             "docker/*",
             "Makefile",
+            "trainer/check/*",
         ]
     },
     entry_points={

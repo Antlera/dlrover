@@ -73,6 +73,12 @@ def new_job_auto_scaler(
 class JobAutoScaler(metaclass=ABCMeta):
     """JobAutoScaler automatically scale up/down nodes of job."""
 
+    def __init__(self):
+        self._suggested_stop = False
+
+    def suggested_stop(self):
+        return self._suggested_stop
+
     @abstractmethod
     def start_auto_scaling(self):
         """Start auto-scaling nodes of a job"""
@@ -102,6 +108,7 @@ class PSTrainingAutoScaler(JobAutoScaler):
         worker_manager: WorkerManager,
         node_scaler: Scaler,
     ) -> None:
+        super().__init__()
         self._job_resource = job_resource
         self._job_optimizer = job_optimizer
         self._speed_monitor = speed_monitor
@@ -228,7 +235,7 @@ class PSTrainingAutoScaler(JobAutoScaler):
         if len(workers) > 0:
             plan = self._worker_manager.migrate_workers(workers)
             scale_plan.merge(plan)
-        logger.info("Migration plan = %s", scale_plan.toJSON())
+        logger.info("Migration plan = %s", scale_plan.to_json())
         return scale_plan
 
     def _reduce_timeout_pending_node_resource(self):
@@ -256,6 +263,7 @@ class AllreduceTrainingAutoScaler(JobAutoScaler):
         worker_manager: WorkerManager,
         node_scaler: Scaler,
     ) -> None:
+        super().__init__()
         self._job_resource = job_resource
         self._job_optimizer = job_optimizer
         self._speed_monitor = speed_monitor

@@ -79,13 +79,12 @@ class ParameterServerManager(TrainingNodeManager):
                 self._training_ps_cluster.append(node)
                 self._next_training_ps_cluster.append(node)
 
-    def relaunch_node(self, node: Node):
+    def relaunch_node(self, node: Node, remove_exited_node=False):
         plan = ScalePlan()
         with self._lock:
             node.is_released = True
             new_id = next(self._node_id_iter)
             self._nodes[new_id] = node.get_relaunch_node_info(new_id)
-            self._nodes.pop(node.id)
             if node in self._training_ps_cluster:
                 i = self._training_ps_cluster.index(node)
                 self._training_ps_cluster[i] = self._nodes[new_id]
@@ -102,6 +101,8 @@ class ParameterServerManager(TrainingNodeManager):
             )
         )
         self._ps_cluster_changed = True
+        if remove_exited_node and not node.is_released and node.exited():
+            plan.remove_nodes.append(node)
         return plan
 
     def adjust_ps(self, ps_resource: NodeGroupResource):
@@ -255,6 +256,7 @@ class ParameterServerManager(TrainingNodeManager):
                 and node.status == NodeStatus.RUNNING
             ):
                 if node not in self._pre_dropped_ps:
+                    node.migrated = True
                     self._pre_dropped_ps.append(node)
 
     def get_total_request_cpu(self):

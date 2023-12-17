@@ -153,7 +153,8 @@ class JobOptStage(object):
     CREATE = "job_stage_create"
     PS_INITIAL = "job_stage_ps_initial"
     WORKER_INITIAL = "job_stage_worker_initial"
-    RUNNING = "job_stage_running"
+    PS_RUNNING = "job_stage_ps_running"
+    WORKER_RUNNING = "job_stage_worker_running"
 
 
 class OptimizeWorkerPhase(object):
@@ -191,14 +192,22 @@ class TrainingLoopStatus(object):
 class NodeEnv(object):
     RELAUNCHED_POD = "RELAUNCHED_POD"
     DLROVER_MASTER_ADDR = "DLROVER_MASTER_ADDR"
+    GRPC_ENABLE_FORK = "GRPC_ENABLE_FORK_SUPPORT"
+    POD_NAME = "POD_NAME"
+    AUTO_MONITOR_WORKLOAD = "AUTO_MONITOR_WORKLOAD"
+    JOB_NAME = "ELASTIC_JOB_NAME"
+    JOB_UID = "JOB_UID"
+
+    NODE_TYPE = "NODE_TYPE"
+    NODE_ID = "NODE_ID"
+    NODE_NUM = "NODE_NUM"
+    NODE_RANK = "NODE_RANK"
+
+    # Deprecated env vars.
     WORKER_TYPE = "WORKER_TYPE"
     WORKER_ID = "WORKER_ID"
     WORKER_NUM = "WORKER_NUM"
     WORKER_RANK = "WORKER_RANK"
-    RDZV_ENDPOINT = "RDZV_ENDPOINT"
-    GRPC_ENABLE_FORK = "GRPC_ENABLE_FORK_SUPPORT"
-    POD_NAME = "POD_NAME"
-    AUTO_MONITOR_WORKLOAD = "AUTO_MONITOR_WORKLOAD"
 
 
 class DatasetType(object):
@@ -251,3 +260,16 @@ class TrainingMsgLevel(object):
     NODE_ERROR = "node_error"
     WARNING = "warning"
     INFO = "info"
+
+
+class ConfigPath(object):
+    ENV_PARAL_CONFIG = "DLROVER_PARAL_CONFIG_PATH"
+    PARAL_CONFIG = "/tmp/dlrover/auto_paral_config.json"
+    ENV_RUNTIME_METRICS = "RUNTIME_METRICS_PATH"
+    RUNTIME_METRICS = "/tmp/dlrover/runtime_metrics.json"
+    NETWORK_CHECK_DATA_DIR = "/tmp/dlrover/network_check/"
+
+
+class CheckpointConstant(object):
+    CKPT_NAME_PREFIX = "checkpoint-"
+    TRACER_FILE_NAME = "latest_checkpointed_iteration.txt"

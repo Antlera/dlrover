@@ -16,8 +16,12 @@ import unittest
 
 from dlrover.proto import elastic_training_pb2
 from dlrover.python.common.constants import NodeType
+from dlrover.python.common.grpc import TaskResult
 from dlrover.python.master.shard.task_manager import DatasetShardCheckpoint
-from dlrover.python.tests.test_utils import create_task_manager
+from dlrover.python.tests.test_utils import (
+    create_task_manager,
+    create_test_dataset_splitter,
+)
 
 
 class TaskMangerTest(unittest.TestCase):
@@ -30,9 +34,7 @@ class TaskMangerTest(unittest.TestCase):
         dataset_manager = task_manager.get_dataset(dataset_name)
         self.assertIsNotNone(dataset_manager)
 
-        request = elastic_training_pb2.ReportTaskResultRequest()
-        request.task_id = 0
-        request.dataset_name = dataset_name
+        request = TaskResult(dataset_name=dataset_name, task_id=0)
         task, worker_id = task_manager.report_dataset_task(request, True)
         self.assertEqual(worker_id, 0)
         self.assertEqual(task.task_id, 0)
@@ -48,9 +50,7 @@ class TaskMangerTest(unittest.TestCase):
         dataset = task_manager.get_dataset(dataset_name)
         task = task_manager.get_dataset_task(NodeType.WORKER, 0, dataset_name)
         self.assertEqual(len(dataset.todo), 9)
-        request = elastic_training_pb2.ReportTaskResultRequest()
-        request.task_id = task.task_id
-        request.dataset_name = dataset_name
+        request = TaskResult(dataset_name=dataset_name, task_id=task.task_id)
         task_manager.report_dataset_task(request, False)
         self.assertEqual(len(dataset.todo), 10)
         self.assertEqual(len(dataset.doing), 0)
@@ -105,3 +105,39 @@ class TaskMangerTest(unittest.TestCase):
         dataset._latest_task_end_time = 3600
         hang = task_manager.task_hanged()
         self.assertTrue(hang)
+
+    def test_paral_eval_count(self):
+        task_manager = create_task_manager()
+        eval_ds = "test-eval"
+        splitter = create_test_dataset_splitter(eval_ds)
+        task_manager.new_dataset(
+            batch_size=10,
+            dataset_size=1000,
+            dataset_name=eval_ds,
+            dataset_splitter=splitter,
+            task_type=elastic_training_pb2.EVALUATION,
+        )
+        eval_count = task_manager.get_paral_eval_count()
+        self.assertEqual(eval_count, 0)
+        task_manager.get_dataset_task(
+            NodeType.WORKER,
+            0,
+            "test-eval",
+        )
+        task_manager.get_dataset_task(
+            NodeType.WORKER,
+            0,
+            "test",
+        )
+        task_manager.get_dataset_task(
+            NodeType.WORKER,
+            0,
+            "test-eval",
+        )
+        task_manager.get_dataset_task(
+            NodeType.WORKER,
+            0,
+            "test",
+        )
+        eval_count = task_manager.get_paral_eval_count()
+        self.assertEqual(eval_count, 2)

@@ -107,7 +107,11 @@ def reduce_timeout_pending_node_resource(node: Node):
     """Reduce CPU cores or memroy and relaunch it if the pending
     time is too long"""
     now = time.time()
-    if node.is_released or not node.create_time:
+    if (
+        node.is_released
+        or not node.create_time
+        or node.config_resource.gpu_num > 0
+    ):
         return False
     pending_time = now - node.create_time.timestamp()
     if pending_time < _dlrover_context.seconds_to_wait_pending_pod:
@@ -163,12 +167,12 @@ class TrainingNodeManager(object):
         self._new_node_name_fn = new_node_name_fn
         self._lock = threading.Lock()
         self._node_id_iter = itertools.count(len(self._nodes))
-        self._rank_id_iter = itertools.count(len(self._nodes))
+        self._node_rank_iter = itertools.count(len(self._nodes))
 
     def update_nodes(self, nodes):
         self._nodes = nodes
         self._node_id_iter = itertools.count(len(self._nodes))
-        self._rank_id_iter = itertools.count(len(self._nodes))
+        self._node_rank_iter = itertools.count(len(self._nodes))
 
     def remove_node(self, node_id):
         plan = ScalePlan()
@@ -184,10 +188,9 @@ class TrainingNodeManager(object):
         plan.remove_nodes.append(worker)
         return plan
 
-    def relaunch_node(self, node: Node):
+    def relaunch_node(self, node: Node, remove_exited_node=False):
         plan = ScalePlan()
         with self._lock:
-            node.is_released = True
             new_id = next(self._node_id_iter)
             relaunch_node = node.get_relaunch_node_info(new_id)
             self._nodes[new_id] = relaunch_node
@@ -203,6 +206,9 @@ class TrainingNodeManager(object):
                 relaunch_count=relaunch_node.relaunch_count,
             )
         )
+        if remove_exited_node and not node.is_released and node.exited():
+            node.is_released = True
+            plan.remove_nodes.append(node)
         return plan
 
     def reduce_pending_node_resource(self):
@@ -319,17 +325,22 @@ class TrainingNodeManager(object):
     def running_nodes_hanged(self) -> List[bool]:
         cur_time = time.time()
         node_hang = []
-        for _, node in self._nodes.items():
+        nodes = list(self._nodes.values())  # Avoid dictionary changed size.
+        for node in nodes:
             if node.status == NodeStatus.RUNNING:
+                timeout = NodeResourceLimit.MAX_HANG_TIMEOUT_SECS
                 hang = (
                     node.start_hang_time > 0
-                    and cur_time - node.start_hang_time
-                    > NodeResourceLimit.MAX_HANG_TIMEOUT_SECS
+                    and cur_time - node.start_hang_time > timeout
                 )
-                if hang:
+                if not node.hang and hang:
                     time_array = time.localtime(node.start_hang_time)
                     date_time = time.strftime("%Y-%m-%d %H:%M:%S", time_array)
-                    logger.warning("Node %s hangs at %s", node.name, date_time)
+                    logger.warning(
+                        f"Node {node.name} hangs with timeout "
+                        f"{timeout} from {date_time}!!!"
+                    )
+                node.hang = hang
                 node_hang.append(hang)
         return node_hang
 

@@ -1,4 +1,4 @@
-# Copyright 2022 The EasyDL Authors. All rights reserved.
+# Copyright 2022 The DLRover Authors. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -52,6 +52,7 @@ class ElasticJobScalerTest(unittest.TestCase):
         plan.node_group_resources["worker"] = group_resource
 
         scaler = ElasticJobScaler("test", "dlrover")
+        scaler.start()
         scaler_crd = scaler._generate_scale_plan_crd(plan)
 
         expected_dict = {

@@ -1,8 +1,12 @@
+import hashlib
 import logging
 import os
 import sys
 import time
+import traceback
 import typing  # type: ignore # noqa: F401
+
+import torch
 
 import atorch
 
@@ -33,11 +37,25 @@ def get_logger(name, level="INFO", handlers=None, update=False):
 default_logger = get_logger(_DEFAULT_LOGGER)
 
 
+logged_messages = set()
+
+
+# Function to log a message only once
+def log_once(message):
+    call_stack = repr(traceback.extract_stack()[:-1])
+    message_hash = hashlib.md5((call_stack + message).encode("utf-8")).hexdigest()
+    if message_hash not in logged_messages:
+        logging.info(message)
+        logged_messages.add(message_hash)
+
+
 class DashBoardWriter(object):
     def __init__(self, logdir="./"):
         from torch.utils.tensorboard import SummaryWriter
 
-        self.writer = SummaryWriter(logdir)
+        self.rank = int(os.environ.get("RANK", 0))
+        if self.rank == 0:
+            self.writer = SummaryWriter(logdir)
 
     def add_scalars(self, stats, n_iter, name=None):
 
@@ -51,14 +69,17 @@ class DashBoardWriter(object):
                     find_key_value(prefix + key + "/", value)
 
         find_key_value("", stats)
-        print(key_val_list)
 
         for item in key_val_list:
             key, val = item
-            self.writer.add_scalar(key, val, n_iter)
+            if self.rank == 0:
+                if isinstance(val, torch.Tensor):
+                    val = val.detach().clone().float().cpu().item()
+                self.writer.add_scalar(key, val, n_iter)
 
     def flush(self):
-        self.writer.flush()
+        if self.rank == 0:
+            self.writer.flush()
 
 
 class TimeStats:

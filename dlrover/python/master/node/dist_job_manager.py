@@ -28,8 +28,12 @@ from dlrover.python.common.constants import (
     NodeType,
 )
 from dlrover.python.common.global_context import Context
+from dlrover.python.common.grpc import ParallelConfig
 from dlrover.python.common.log import default_logger as logger
 from dlrover.python.common.node import Node, NodeGroupResource
+from dlrover.python.master.hyperparams.simple_strategy_generator import (
+    SimpleStrategyGenerator,
+)
 from dlrover.python.master.monitor.error_monitor import (
     ErrorLogMonitor,
     ErrorMonitor,
@@ -99,6 +103,7 @@ class DistributedJobManager(JobManager):
         job_scaler=None,
         error_monitor=None,
     ):
+        self._remove_exited_node = job_args.remove_exited_node
         self._job_resource = JobResource()
         node_restart_count: Dict[str, int] = {}
         for type, node_args in job_args.node_args.items():
@@ -109,6 +114,9 @@ class DistributedJobManager(JobManager):
 
         self._job_args = job_args
         self._ps_is_critical = False
+        self._job_strategy_generator: SimpleStrategyGenerator = (
+            SimpleStrategyGenerator(self._job_args.job_uuid)
+        )
         if (
             job_args.distribution_strategy == DistributionStrategy.PS
             or job_args.distribution_strategy == DistributionStrategy.CUSTOM
@@ -394,7 +402,7 @@ class DistributedJobManager(JobManager):
         node_type = event.node.type
         node_id = event.node.id
         if node_id not in self._job_nodes[node_type]:
-            self._job_nodes[node_type][node_id] = event.node
+            logger.info(f"The node {event.node.name} is released.")
             return
         else:
             cur_node = self._job_nodes[node_type][node_id]
@@ -404,6 +412,7 @@ class DistributedJobManager(JobManager):
                 create_time=event.node.create_time,
                 host_name=event.node.host_name,
                 host_ip=event.node.host_ip,
+                restart_training=event.node.restart_training,
             )
 
         # For the given node id, check whether it meets
@@ -416,7 +425,6 @@ class DistributedJobManager(JobManager):
             status_change_flow: NodeStateFlow = get_node_state_flow(
                 old_status, event.event_type, new_status
             )
-            cur_node.update_status(new_status)
             # If there is no matched state change, return directly
             # If the node has been succeed, return directly
             if (
@@ -426,6 +434,7 @@ class DistributedJobManager(JobManager):
                 return
 
             # Update the node status
+            cur_node.update_status(new_status)
             new_status = status_change_flow.to_status
             cur_node.set_exit_reason(event.node.exit_reason)
             self._process_node_events(status_change_flow, cur_node)
@@ -523,17 +532,38 @@ class DistributedJobManager(JobManager):
 
     def _relaunch_node(self, node: Node):
         if node.type == NodeType.WORKER:
-            plan = self._worker_manager.relaunch_node(node)
+            plan = self._worker_manager.relaunch_node(
+                node, self._remove_exited_node
+            )
         elif node.type == NodeType.PS:
-            plan = self._ps_manager.relaunch_node(node)
+            plan = self._ps_manager.relaunch_node(
+                node, self._remove_exited_node
+            )
         elif node.type == NodeType.EVALUATOR:
-            plan = self._evaluator_manager.relaunch_node(node)
+            plan = self._evaluator_manager.relaunch_node(
+                node, self._remove_exited_node
+            )
         elif node.type == NodeType.CHIEF or node.type == NodeType.MASTER:
-            plan = self._chief_manager.relaunch_node(node)
+            plan = self._chief_manager.relaunch_node(
+                node, self._remove_exited_node
+            )
         else:
             logger.error("Not support node type %s", node.type)
         self._set_ps_addrs_in_plan(plan)
         self._scaler.scale(plan)
+
+    def clear_exited_nodes(self):
+        if not self._remove_exited_node:
+            return
+        scale_plan = ScalePlan()
+        for _, nodes in self._job_nodes.items():
+            for _, node in nodes.items():
+                if not node.is_released and node.exited():
+                    scale_plan.remove_nodes.append(node)
+                    node.is_released = True
+        if len(scale_plan.remove_nodes) > 0:
+            logger.info(f"Remove exited nodes {scale_plan.remove_nodes}")
+            self._scaler.scale(scale_plan)
 
     def all_workers_exited(self):
         return (
@@ -578,7 +608,7 @@ class DistributedJobManager(JobManager):
         else:
             logger.info("Delete worker %s", worker_id)
             plan = self._worker_manager.remove_node(worker_id)
-            logger.info("plan %s", plan.toJSON())
+            logger.info("plan %s", plan.to_json())
             self._scaler.scale(plan)
 
     def get_running_nodes(self):
@@ -624,12 +654,10 @@ class DistributedJobManager(JobManager):
         if cpu_percent < _dlrover_context.hang_cpu_usage_percentage:
             if node.start_hang_time == 0:
                 now = datetime.now()
-                logger.info(f"Node {node.name} hangs at {now}")
                 node.start_hang_time = now.timestamp()
         else:
             if node.start_hang_time > 0:
                 now = datetime.now()
-                logger.info(f"Node {node.name} stop hanging at {now}")
             node.start_hang_time = 0
 
     def update_node_service_addr(self, node_type, node_id, service_addr):
@@ -687,8 +715,8 @@ class DistributedJobManager(JobManager):
     def all_running_node_hanged(self):
         node_hang = self._worker_manager.running_nodes_hanged()
         node_hang.extend(self._chief_manager.running_nodes_hanged())
-        node_hang.extend(self._evaluator_manager.running_nodes_hanged())
         node_hang.extend(self._ps_manager.running_nodes_hanged())
+        node_hang.extend(self._evaluator_manager.running_nodes_hanged())
         if node_hang:
             return all(node_hang)
         return False
@@ -721,6 +749,19 @@ class DistributedJobManager(JobManager):
         if isinstance(self._job_optimizer, AllreduceJobResourceOptimizer):
             self._job_optimizer.set_node_unit(node_unit)
 
+    def get_opt_strategy(self) -> ParallelConfig:
+        strategy = self._job_strategy_generator.generate_opt_strategy()
+        return strategy
+
+    def update_node_paral_config(self, node_type, node_id, paral_config):
+        node = self._job_nodes[node_type][node_id]
+        node.update_paral_config(paral_config)
+
+    def verify_restarting_worker_training(self, node_type, node_id):
+        if node_type != NodeType.WORKER:
+            return False
+        return self._worker_manager.verify_restarting_training(node_id)
+
 
 def create_job_manager(args: JobArgs, speed_monitor) -> DistributedJobManager:
     critical_worker_index = get_critical_worker_index(args)
@@ -734,6 +775,7 @@ def create_job_manager(args: JobArgs, speed_monitor) -> DistributedJobManager:
         args.platform, args.job_name, args.namespace
     )
     job_scaler = new_job_scaler(args.platform, args.job_name, args.namespace)
+    job_scaler.start()
 
     return DistributedJobManager(
         job_args=args,

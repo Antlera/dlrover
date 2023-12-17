@@ -135,18 +135,13 @@ class WorkerManager(TrainingNodeManager):
             )
         )
         alive_workers = []
-        completed_worker_num = 0
         for worker in self._nodes.values():
             if worker.status in ALIVE_STATUS:
                 alive_workers.append(worker)
-            elif worker.status in [NodeStatus.SUCCEEDED, NodeStatus.FINISHED]:
-                completed_worker_num += 1
         alive_num = len(alive_workers)
         with self._lock:
-            if num > alive_num + completed_worker_num:
-                plan = self._scale_up_workers(
-                    num - alive_num - completed_worker_num
-                )
+            if num > alive_num:
+                plan = self._scale_up_workers(num - alive_num)
             elif num < alive_num:
                 plan = self._scale_down_workers(alive_num - num, alive_workers)
         return plan
@@ -156,7 +151,7 @@ class WorkerManager(TrainingNodeManager):
         plan = ScalePlan()
         for _ in range(up_num):
             worker_id = next(self._node_id_iter)
-            task_id = next(self._rank_id_iter)
+            task_id = next(self._node_rank_iter)
             worker_resource = self._job_resource.get_node_group_resource(
                 NodeType.WORKER
             ).node_resource
@@ -216,7 +211,7 @@ class WorkerManager(TrainingNodeManager):
             ]:
                 worker.relaunchable = False
                 logger.info(
-                    "Remove the worker %s after the worker-0 completed",
+                    "Remove the worker %s after the chief completed",
                     worker.name,
                 )
                 worker.is_released = True
@@ -235,6 +230,11 @@ class WorkerManager(TrainingNodeManager):
         for name, resource in workers.items():
             old_node_id = int(name.split("-")[-1])
             old_node = self._nodes[old_node_id]
+            if old_node.critical:
+                continue
+            old_node.migrated = True
+            old_node.relaunchable = False
+            old_node.is_released = True
             node_id = next(self._node_id_iter)
             task_id = old_node.rank_index
             new_node = Node(
@@ -280,3 +280,25 @@ class WorkerManager(TrainingNodeManager):
             ):
                 return True
         return False
+
+    def verify_restarting_training(self, node_id):
+        """
+        Verify if the worker requires restarting the training process.
+        The worker will restart the training processes if any of the
+        following conditions are met:
+            1. RestartTrain action in the Pod annotations.
+            2. One training process crashes in the worker.
+
+        args:
+            node_id: the worker node id.
+
+        Return:
+            bool
+        """
+        restart = False
+        worker = self._nodes[node_id]
+        if not worker.is_released:
+            restart = worker.restart_training
+            # Set False to avoid restart repeatedly.
+            worker.restart_training = False
+        return restart

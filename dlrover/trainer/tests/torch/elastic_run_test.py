@@ -15,13 +15,36 @@ import unittest
 
 from dlrover.trainer.torch.elastic_run import (
     _check_dlrover_master_available,
+    _elastic_config_from_args,
     _launch_dlrover_local_master,
+    parse_args,
 )
 
 
 class ElasticRunTest(unittest.TestCase):
     def test_launch_local_master(self):
-        handler, addr = _launch_dlrover_local_master()
+        handler, addr = _launch_dlrover_local_master("")
         available = _check_dlrover_master_available(addr)
         self.assertTrue(available)
         handler.close()
+
+    def test_elastic_config_from_args(self):
+        args = [
+            "--network_check",
+            "--auto_tunning",
+            "--node_unit",
+            "4",
+            "--nnodes",
+            "4",
+            "test.py",
+            "--batch_size",
+            "16",
+        ]
+        args = parse_args(args)
+        config, cmd, cmd_args = _elastic_config_from_args(args)
+        self.assertTrue(config.network_check)
+        self.assertTrue(config.auto_tunning)
+        self.assertEqual(config.node_unit, 4)
+        self.assertEqual(config.rdzv_configs["node_unit"], 4)
+        self.assertEqual(cmd, "/usr/local/bin/python")
+        self.assertListEqual(cmd_args, ["-u", "test.py", "--batch_size", "16"])

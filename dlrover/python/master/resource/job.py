@@ -165,7 +165,7 @@ class JobResource(JsonSerializable):
         chief.node_resource.memory = worker.node_resource.memory
         self.node_group_resources[NodeType.CHIEF] = chief
         worker.count -= 1
-        logger.info("self = %s", self.toJSON())
+        logger.info("self = %s", self.to_json())
 
 
 class JobResourceOptimizer(metaclass=ABCMeta):
@@ -216,6 +216,12 @@ class PSJobResourceOptimizer(JobResourceOptimizer):
         self.optimize_worker_sampled = False
         self._job_stage = JobOptStage.CREATE
         self._last_ps_change_time = 0.0
+
+    def set_job_stage(self, stage):
+        self._job_stage = stage
+
+    def get_job_stage(self):
+        return self._job_stage
 
     def get_config_resource(self):
         job_config = JobResource()
@@ -295,7 +301,7 @@ class PSJobResourceOptimizer(JobResourceOptimizer):
             if resource.memory < min_memory:
                 resource.memory = self._worker_resource.node_resource.memory
 
-        logger.info("Job resource = %s", job_resource.toJSON())
+        logger.info("Job resource = %s", job_resource.to_json())
         return job_resource
 
     def adjust_oom_resource(self, node):
@@ -394,8 +400,8 @@ class PSJobResourceOptimizer(JobResourceOptimizer):
             self._job_stage = JobOptStage.PS_INITIAL
         elif self._job_stage == JobOptStage.PS_INITIAL:
             plan = self._get_ps_resource_plan()
-            self._job_stage = JobOptStage.RUNNING
-        elif self._job_stage == JobOptStage.RUNNING:
+            self._job_stage = JobOptStage.PS_RUNNING
+        elif self._job_stage == JobOptStage.PS_RUNNING:
             plan = self._get_ps_resource_plan()
             if plan.empty():
                 plan = self._get_worker_resource_at_running()
@@ -440,7 +446,7 @@ class PSJobResourceOptimizer(JobResourceOptimizer):
     def _get_worker_resource_at_stable_phase(self, optimizer_config={}):
         optimizer_config[_WORKER_OPTIMIZE_PHASE] = OptimizeWorkerPhase.STABLE
         plan = self._resource_optimizer.generate_opt_plan(
-            JobOptStage.WORKER_INITIAL, optimizer_config
+            JobOptStage.WORKER_RUNNING, optimizer_config
         )
         if not plan:
             return

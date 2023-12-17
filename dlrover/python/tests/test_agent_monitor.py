@@ -18,18 +18,30 @@ import unittest
 from unittest.mock import patch
 
 from dlrover.python.common.constants import NodeEnv
-from dlrover.python.elastic_agent.monitor.metrics import GPUMetric
+from dlrover.python.common.grpc import GPUStats
+from dlrover.python.elastic_agent.master_client import (
+    MasterClient,
+    build_master_client,
+)
 from dlrover.python.elastic_agent.monitor.resource import ResourceMonitor
 from dlrover.python.elastic_agent.monitor.training import (
-    TrainingProcessReporter,
+    TFTrainingProcessReporter,
     is_tf_chief,
 )
+from dlrover.python.tests.test_utils import start_local_master
 
 
 class ResourceMonitorTest(unittest.TestCase):
+    def setUp(self):
+        self.master_proc, self.addr = start_local_master()
+        MasterClient._instance = build_master_client(self.addr, 0.5)
+
+    def tearDown(self):
+        self.master_proc.stop()
+
     def test_resource_monitor(self):
-        gpu_stats: list[GPUMetric] = [
-            GPUMetric(
+        gpu_stats: list[GPUStats] = [
+            GPUStats(
                 index=0,
                 total_memory_mb=24000,
                 used_memory_mb=4000,
@@ -37,7 +49,7 @@ class ResourceMonitorTest(unittest.TestCase):
             )
         ]
         mock_env = {
-            NodeEnv.DLROVER_MASTER_ADDR: "127.0.0.1:12345",
+            NodeEnv.DLROVER_MASTER_ADDR: self.addr,
             NodeEnv.AUTO_MONITOR_WORKLOAD: "true",
         }
 
@@ -70,9 +82,13 @@ class ResourceMonitorTest(unittest.TestCase):
         }
         os.environ["TF_CONFIG"] = json.dumps(TF_CONFIG)
         self.assertTrue(is_tf_chief())
-        reporter0 = TrainingProcessReporter()
-        reporter1 = TrainingProcessReporter()
+        reporter0 = TFTrainingProcessReporter()
+        reporter1 = TFTrainingProcessReporter()
         self.assertEqual(reporter0, reporter1)
+        reporter0.set_start_time()
+        self.assertTrue(reporter0._start_time > 0)
+        reporter0._last_timestamp = time.time() - 30
+        reporter0.report_resource_with_step(100)
 
 
 if __name__ == "__main__":

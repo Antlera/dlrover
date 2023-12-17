@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import torch
 from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
+from fairscale.nn.misc import ParamBucket
 from fairscale.optim.oss import OSS
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -13,6 +14,7 @@ from atorch.auto import auto_accelerate
 from atorch.auto.opt_lib.utils import to_module_class_by_name
 from atorch.auto.opt_lib.zero_optimization import FSDPOptimization, Zero1Optimization, Zero2Optimization
 from atorch.tests.toy_module import ToyCustomModule, create_model_context
+from atorch.utils.patch_fairscale import patch_add_param_as_view, patch_setup_flat_buffers
 from atorch.utils.version import torch_version
 
 
@@ -63,6 +65,44 @@ class ZeroOptimizationTest(unittest.TestCase):
             self.assertIsInstance(fsdp_model_context.model, FSDP)
         atorch.reset_distributed()
 
+    @unittest.skipIf(not torch.cuda.is_available(), "cuda is not available")
+    def test_fsdp_wrap_trainable_outmost(self):
+        def run_wrap_trainable_outmost(config):
+            fsdp_model_context = copy.deepcopy(self.model_context)
+            fsdp_optimization = FSDPOptimization()
+            for name, param in fsdp_model_context.model.named_parameters():
+                if "bias" in name:
+                    param.requires_grad = False
+            atorch.init_distributed("nccl")
+            zero_conf = {
+                "sync_module_states": True,
+                "forward_prefetch": True,
+                "atorch_wrap_cls": ("Linear",),
+                "wrap_trainable_outmost": config,
+            }
+            fsdp_model_context = fsdp_optimization.transform(fsdp_model_context, config=zero_conf)
+            if torch_version() < (2, 1, 0):
+                with self.assertRaises(RuntimeError):
+                    fsdp_model_context.apply_wrappers(is_pre_wrapper=True)
+            else:
+                fsdp_model_context.apply_wrappers(is_pre_wrapper=True)
+                self.assertIsInstance(fsdp_model_context.model, FSDP)
+                cpu_device = torch.device("cpu")
+                for _, m in fsdp_model_context.model.named_modules():
+                    if isinstance(m, FSDP):
+                        self.assertTrue(len(m._ignored_params) == 0)
+                trainable_param_num = 0
+                for p in fsdp_model_context.model.parameters():
+                    self.assertTrue(p.device != cpu_device)
+                    if p.requires_grad:
+                        trainable_param_num += 1
+                self.assertEqual(trainable_param_num, 1)
+            atorch.reset_distributed()
+
+        configs = [True, "NO_SHARD"]
+        for config in configs:
+            run_wrap_trainable_outmost(config)
+
     def test_to_module_class_by_name(self):
         model = self.model_context.model
         wrap_cls = [ToyCustomModule]
@@ -79,6 +119,7 @@ class ZeroOptimizationTest(unittest.TestCase):
         self.assertEqual(result[0], ToyCustomModule)
         self.assertEqual(result[1].__name__, "Linear")
 
+    @unittest.skipIf(not torch.cuda.is_available(), "cuda is not available")
     def test_fsdp(self):
         model_context = create_model_context(data_size=4, batch_size=1)
         # test fsdp in cpu mode
@@ -149,6 +190,10 @@ class ZeroOptimizationTest(unittest.TestCase):
         for param in model_context.model.parameters():
             self.assertEqual(param.device.type, "cpu")
         atorch.reset_distributed()
+
+    def test_fairscale_patch(self):
+        self.assertEqual(OSS._setup_flat_buffers, patch_setup_flat_buffers)
+        self.assertEqual(ParamBucket._add_param_as_view, patch_add_param_as_view)
 
 
 if __name__ == "__main__":

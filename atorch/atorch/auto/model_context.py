@@ -27,6 +27,8 @@ from atorch.distributed.distributed import (
     parallel_rank,
     rank,
 )
+from atorch.modules.distributed_modules.materialize_modules import materialize_modules_to_device
+from atorch.optimizers import BF16Optimizer
 from atorch.utils.graph_transform_utils import map_aggregate
 from atorch.utils.version import torch_version
 
@@ -100,6 +102,11 @@ def get_data_partition_rank_and_size():
     return drank, data_size
 
 
+def get_mc_default_args():
+    args = {"use_optim_backward": False, "requires_set_gradient_accumulation_boundary": False}
+    return args
+
+
 class ModelContext(object):
     """
     Model context contains model training related objects,
@@ -152,6 +159,8 @@ class ModelContext(object):
         self.expand_sample_batch = self.extra_args.get("expand_sample_batch", True)
         self._check_data_related_args()
         self.tp_status = False
+        self.sampler_seed = self.extra_args.get("sampler_seed", 0)  # pytorch DistributedSamper default seed is 0
+        self.args = get_mc_default_args()
 
     def update_tp_status(self, status):
         self.tp_status = status
@@ -306,7 +315,9 @@ class ModelContext(object):
                 shuffle = bool(args["shuffle"])
                 if shuffle:
                     args["shuffle"] = False
-            sampler = self.distributed_sampler_cls(self.dataset, shuffle=shuffle, num_replicas=ddp_size, rank=rank)
+            sampler = self.distributed_sampler_cls(
+                self.dataset, shuffle=shuffle, num_replicas=ddp_size, rank=rank, seed=self.sampler_seed
+            )
             # strong scaling, so adjust batchsize
             if "batch_size" in args:
                 ori_batchsize = args["batch_size"]
@@ -359,9 +370,9 @@ class ModelContext(object):
 
     def check_pipe_model(self):
         # import pippy related modules here to avoid PiPPy initialization messes up env
-        from atorch.modules.distributed_modules.compilers import DeviceSafeDriver
+        from atorch.modules.distributed_modules.compilers import DeviceSafeDriver, SafeStage
 
-        return isinstance(self.model, DeviceSafeDriver)
+        return isinstance(self.model, (DeviceSafeDriver, SafeStage))
 
     def create_optim(self):
         """
@@ -369,6 +380,34 @@ class ModelContext(object):
         """
         if self.optim_func is None:
             return None
+
+        # model must on cuda device before calling OSS (zero2)
+        if "zero2" in self.post_wrappers or "ds_zero" in self.post_wrappers:
+            model_device = next(self.model.parameters()).device
+            if torch.cuda.is_available() and model_device.type != "cuda":
+                if local_rank() is not None:
+                    device = torch.device(type="cuda", index=local_rank())
+                else:
+                    device = torch.device(type="cuda")
+                materialize_modules_to_device(self.model, device)
+
+        if "ds_zero" in self.post_wrappers:
+            # sync model parameters/buffers.
+            module_states = []
+            for param in self.model.parameters():
+                module_states.append(param.detach())
+
+            for buffer in self.model.buffers():
+                module_states.append(buffer.detach())
+
+            src = 0
+            process_group, ranks = parallel_group_and_ranks("zero")
+            if process_group is None:
+                process_group, ranks = parallel_group_and_ranks("data")
+            if ranks is not None:
+                src = ranks[0]
+            torch.distributed._broadcast_coalesced(process_group, module_states, int(250 * 1024 * 1024), src)
+
         if not self.check_pipe_model():
             if not self.optim_param_func:
                 optim = self.optim_func(self.model.parameters(), **self.optim_args)
@@ -381,6 +420,25 @@ class ModelContext(object):
                     "model parameter retrieval is handled by pipe stage executor, optim_param_func will not take effect"
                 )
             logger.info(f"successfully construct optimizer at {rank()}")
+
+        # Use BF16Optimizer if using half with bf16 and not using ds zero
+        if (
+            "half" in self.pre_wrappers
+            and self.pre_wrappers["half"][1] == "bf16"
+            and "ds_zero" not in self.post_wrappers
+            and "zero2" not in self.post_wrappers
+            and "fsdp" not in self.pre_wrappers
+            and "ds_3d_parallel" not in self.post_wrappers
+        ):
+            model_device = next(self.model.parameters()).device
+            # model must on cuda device before calling BF16Optimizer
+            if torch.cuda.is_available() and model_device.type != "cuda":
+                if local_rank() is not None:
+                    device = torch.device(type="cuda", index=local_rank())
+                else:
+                    device = torch.device(type="cuda")
+                materialize_modules_to_device(self.model, device)
+            optim = BF16Optimizer(optim)
         return optim
 
     def _create_lr_scheduler(self):
@@ -508,6 +566,8 @@ class ModelContext(object):
                 )
 
         ddp_wrapper_exist = "ddp" in self.post_wrappers
+        ds_zero_wrapper_exist = "ds_zero" in self.post_wrappers
+        ds_3d_parallel_wrapper_exist = "ds_3d_parallel" in self.post_wrappers
         fairscale_zero2_wrapper_exist = "zero2" in self.post_wrappers
         fsdp_wrapper_exist = "fsdp" in self.pre_wrappers or "zero2" in self.pre_wrappers
         tensor_parallel_wrapper_exist = "tp" in self.pre_wrappers
@@ -515,8 +575,10 @@ class ModelContext(object):
         native_dynamo_wrapper_exist = "native_dynamo" in self.pre_wrappers
 
         # remove ddp wrapper when using zero2
-        if ddp_wrapper_exist and (fairscale_zero2_wrapper_exist or fsdp_wrapper_exist):
-            logger.info("Found Zero and ddp wrapper or pipe wrapper, remove ddp wrapper")
+        if ddp_wrapper_exist and (
+            fairscale_zero2_wrapper_exist or fsdp_wrapper_exist or ds_zero_wrapper_exist or ds_3d_parallel_wrapper_exist
+        ):
+            logger.info("Found Zero, ds_3d_parallel, or pipe wrapper, remove ddp wrapper.")
             self.post_wrappers.pop("ddp")
             ddp_wrapper_exist = False
         if fsdp_wrapper_exist and "amp_native" in self.post_wrappers:

@@ -1,22 +1,115 @@
 import functools
+import types
 from copy import copy
+from functools import partial
 
 import torch
 from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
 from fairscale.optim.oss import OSS
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+import atorch.utils.patch_fairscale  # noqa: F401
+
 try:
     from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy as auto_wrap_policy
 except ImportError:
     from torch.distributed.fsdp.wrap import default_auto_wrap_policy as auto_wrap_policy
 
+from typing import Set, Type
+
 from atorch.auto.opt_lib.optimization import Optimization
 from atorch.auto.opt_lib.utils import find_modules, to_module_class_by_name
+from atorch.common.log_utils import default_logger as logger
 from atorch.distributed.distributed import local_rank, parallel_group, parallel_group_size
 from atorch.modules.distributed_modules.materialize_modules import materialize_modules_to_device
 from atorch.utils.meta_model_utils import is_meta
 from atorch.utils.version import torch_version
+
+
+def _skip_match_module_child_wrap_policy_pre_2(
+    module: torch.nn.Module,
+    recurse: bool,
+    unwrapped_params: int,
+    module_classes: Set[Type[torch.nn.Module]],
+) -> bool:
+    return _skip_match_module_child_wrap_policy(module, recurse, unwrapped_params, module_classes)
+
+
+def _skip_match_module_child_wrap_policy(
+    module: torch.nn.Module,
+    recurse: bool,
+    nonwrapped_numel: int,
+    module_classes: Set[Type[torch.nn.Module]],
+) -> bool:
+    # skip to wrap any children of a matched module.
+    match = isinstance(module, tuple(module_classes))
+    attr_name = "_ignore_fsdp_wrap_tag"
+    if match:
+        for _, child in module.named_modules():
+            if child != module:
+                setattr(child, attr_name, True)
+    if getattr(module, attr_name, False):
+        delattr(module, attr_name)
+        return False
+    if recurse:
+        return True  # always recurse if not skip
+    return match
+
+
+def get_skip_match_module_child_wrap_policy(wrap_cls, model=None):
+    # wrap_cls is a tuple of module type.
+    # If model is provided, wrap_cls tuple can contain module type name.
+    if model is not None:
+        wrap_cls = to_module_class_by_name(model, wrap_cls)
+    if torch_version() >= (2, 0, 0):
+        return functools.partial(_skip_match_module_child_wrap_policy, module_classes=wrap_cls)
+    else:
+        return functools.partial(_skip_match_module_child_wrap_policy_pre_2, module_classes=wrap_cls)
+
+
+def fsdp_wrap_params_outmost(model, param_list, outmost_sharding_strategy, **kwargs):
+    """
+    Minimum torch version required: 2.1.0.
+    Cannot used with ignored_states or ignored_modules in kwargs
+    FSDP wraps model with kwargs, but ignores parameters in param_list.
+    Then add an outmost wrap for parameters in param_list.
+    """
+    if torch_version() < (2, 1, 0):
+        raise RuntimeError("fsdp_wrap_params_outmost requires torch version >= 2.1")
+    ignored_states = kwargs.get("ignored_states", None)
+    ignored_modules = kwargs.get("ignored_modules", None)
+    if ignored_modules is not None or ignored_states is not None:
+        raise ValueError("fsdp_wrap_params_outmost cannot be used with ignored_states or ignored_modules")
+    # step 1: wrap with ignored_states
+    model = FSDP(model, ignored_states=param_list, **kwargs)
+    # step 2: move param_list to gpu if not so, as torch 20230906 nightly would skip ignored_params for move_to_gpu.
+    cpu_device = torch.device("cpu")
+    gpu_device = kwargs["device_id"] if "device_id" in kwargs else torch.device("cuda", torch.cuda.current_device())
+    for param in param_list:
+        if param.device == cpu_device:
+            with torch.no_grad():
+                param.data = param.to(gpu_device)
+    # step 3: clear _ignored_params so param_list can be wrapped in step 3.
+    for _, m in model.named_modules():
+        if isinstance(m, FSDP):
+            m._ignored_params.clear()
+    # step 4: outmost wrap parameters in param_list without auto_wrap_policy.
+    outer_kwargs = copy(kwargs)
+    if "auto_wrap_policy" in kwargs:
+        outer_kwargs.pop("auto_wrap_policy")
+    outer_kwargs["sharding_strategy"] = outmost_sharding_strategy
+    model = FSDP(model, **outer_kwargs)
+    return model
+
+
+def fsdp_wrap_trainable_outmost(model, outmost_sharding_strategy, **kwargs):
+    params = []
+    for p in model.parameters():
+        if p.requires_grad:
+            params.append(p)
+    if len(params) == 0:
+        raise ValueError("No trainable parameters in model!")
+    return fsdp_wrap_params_outmost(model, params, outmost_sharding_strategy, **kwargs)
 
 
 class Zero1Optimization(Optimization):
@@ -39,13 +132,25 @@ class Zero1Optimization(Optimization):
         # skip zero1 optimization when user did not pass optim_func
         if model_context.optim_func is None:
             return model_context
-        new_optim_args = {}
-        new_optim_args["optim"] = model_context.optim_func
-        new_optim_args["group"] = parallel_group("data")
-        new_optim_args.update(model_context.optim_args)
 
-        model_context.optim_func = OSS
-        model_context.optim_args = new_optim_args
+        config = copy(config) or {}
+        use_ds_zero = config.pop("use_ds_zero", False)
+        if use_ds_zero:
+            config["zero2"] = False
+            model_context.add_wrapper(
+                "ds_zero",
+                apply_ds_zero_wrapper,
+                config,
+                is_pre_wrapper=False,
+            )
+        else:
+            new_optim_args = {}
+            new_optim_args["optim"] = model_context.optim_func
+            new_optim_args["group"] = parallel_group("data")
+            new_optim_args.update(model_context.optim_args)
+
+            model_context.optim_func = OSS
+            model_context.optim_args = new_optim_args
 
         return model_context
 
@@ -71,8 +176,17 @@ class Zero2Optimization(Optimization):
         if model_context.optim_func is None:
             return model_context
         config = copy(config) or {}
+        use_ds_zero = config.pop("use_ds_zero", False)
         not_use_fsdp = config.pop("not_use_fsdp", False)
-        if not_use_fsdp or torch_version() < (1, 12, 0) or not torch.cuda.is_available():
+        if use_ds_zero:
+            config["zero2"] = True
+            model_context.add_wrapper(
+                "ds_zero",
+                apply_ds_zero_wrapper,
+                config,
+                is_pre_wrapper=False,
+            )
+        elif not_use_fsdp or torch_version() < (1, 12, 0) or not torch.cuda.is_available():
             # use fairscale zero2 with OSS
             new_optim_args = {}
             new_optim_args["optim"] = model_context.optim_func
@@ -175,7 +289,7 @@ class FSDPOptimization(Optimization):
 
             wrap_policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls=set(wrap_cls))
             wrapper_config["auto_wrap_policy"] = wrap_policy
-        else:
+        elif "auto_wrap_policy" not in wrapper_config:
             policy_param_name = "auto_wrap_policy" if torch_version() >= (1, 12, 0) else "fsdp_auto_wrap_policy"
             if "atorch_size_based_min_num_params" in wrapper_config:
                 min_num_params = wrapper_config["atorch_size_based_min_num_params"]
@@ -183,6 +297,16 @@ class FSDPOptimization(Optimization):
             else:
                 min_num_params = 1e5
             wrapper_config[policy_param_name] = functools.partial(auto_wrap_policy, min_num_params=min_num_params)
+
+        wrap_trainable_outmost = wrapper_config.pop("wrap_trainable_outmost", False)
+        if wrap_trainable_outmost:
+            if torch_version() < (2, 1, 0):
+                raise RuntimeError("fsdp_wrap_params_outmost requires torch version >= 2.1")
+            from torch.distributed.fsdp.api import ShardingStrategy
+
+            outmost_sharding_strategy = (
+                ShardingStrategy.NO_SHARD if wrap_trainable_outmost == "NO_SHARD" else ShardingStrategy.FULL_SHARD
+            )
 
         if torch_version() >= (1, 12, 0):
             # ignore embedding
@@ -202,7 +326,38 @@ class FSDPOptimization(Optimization):
             if not cpu_offload:
                 # Initialize modules' params on gpu and set device id
                 # support meta
-                if is_meta(model_context.model):
+                if "param_init_fn" in wrapper_config:
+                    logger.info("`param_init_fn` has been set, use `param_init_fn` in config")
+                elif is_meta(model_context.model):
+                    from atorch.utils import meta_model_utils
+                    from atorch.utils.meta_model_utils import _find_tied_weights, _retie_weights
+
+                    if meta_model_utils._MetaModeContext._SHARD_FLAT_PARAM_LOADER:
+                        pg = parallel_group("data")
+                        rank0 = torch.distributed.get_rank(pg) == 0
+                        tie_weights = _find_tied_weights(model_context.model)
+                        # ensure model is on meta device
+                        model_context.model = model_context.model.to("meta")
+                        _retie_weights(model_context.model, tie_weights)
+                        for name, p in model_context.model.named_parameters():
+                            setattr(p, "checkpoint_name", name)
+                        for name, p in model_context.model.named_buffers():
+                            setattr(p, "checkpoint_name", name)
+                        intra_load = wrapper_config.pop("intra_load", False)
+                        # sync_module_states has high priority
+                        if "sync_module_states" in wrapper_config:
+                            if rank0:
+                                logger.info("sync_module_states is switch on, disable intra_load")
+                            for name, p in model_context.model.named_parameters():
+                                setattr(p, "sync_module_states", True)
+                        elif intra_load:
+                            if rank0:
+                                logger.info("intra load is switch on")
+                            for name, p in model_context.model.named_parameters():
+                                setattr(p, "intra_load", True)
+                            meta_model_utils._MetaModeContext.get_current_shard_flat_loader().get_fsdp_init_order(
+                                model_context.model, wrap_cls
+                            )
                     wrapper_config["param_init_fn"] = functools.partial(
                         materialize_modules_to_device, device=local_rank()
                     )
@@ -245,12 +400,119 @@ class FSDPOptimization(Optimization):
 
             fsdp_clz = ParseFSDP(fsdp_clz, fsdp_clz is FSDP, cb)
 
+        extra_config["process_group"] = pg
         wrapper_config.update(extra_config)
+        if wrap_trainable_outmost:
+            fsdp_clz = functools.partial(
+                fsdp_wrap_trainable_outmost, outmost_sharding_strategy=outmost_sharding_strategy
+            )
+
         model_context.model = fsdp_clz(
             model_context.model,
-            pg,
             **wrapper_config,
         )
         if torch_version() < (1, 12, 0):
             model_context.model.to(local_rank())
+
         return model_context
+
+
+def apply_ds_zero_wrapper(model_context, wrapper_name, wrapper_config):
+    from deepspeed import comm as ds_dist
+    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+
+    try:
+        # Exists for ds version >= 0.10.1
+        from deepspeed.utils.timer import NoopTimer
+    except ImportError:
+
+        class NoopTimer:
+            class Timer:
+                def start(self):
+                    ...
+
+                def reset(self):
+                    ...
+
+                def stop(self, **kwargs):
+                    ...
+
+                def elapsed(self, **kwargs):
+                    return 0
+
+                def mean(self):
+                    return 0
+
+            def __init__(self):
+                self.timer = self.Timer()
+
+            def __call__(self, name):
+                return self.timer
+
+            def get_timers(self):
+                return {}
+
+            def log(self, names, normalizer=1.0, reset=True, memory_breakdown=False, ranks=None):
+                ...
+
+            def get_mean(self, names, normalizer=1.0, reset=True):
+                ...
+
+    zero2 = wrapper_config.get("zero2")
+    model_dtype = torch.float32
+    if "half" in model_context.pre_wrappers:
+        model_dtype = torch.bfloat16 if model_context.pre_wrappers["half"][1] == "bf16" else torch.half
+
+    ds_config_defaults = {
+        "static_loss_scale": 1.0,
+        "dynamic_loss_args": None,
+        "clip_grad": 0,
+        "cpu_offload": False,
+        "allgather_bucket_size": 5e8,
+        "reduce_bucket_size": 5e8,
+    }
+
+    ds_optim_config = {name: wrapper_config.get(name, ds_config_defaults[name]) for name in ds_config_defaults}
+    ds_optim_config["partition_grads"] = zero2
+    ds_optim_config["contiguous_gradients"] = zero2
+    ds_optim_config["overlap_comm"] = zero2
+    ds_optim_config["dynamic_loss_scale"] = model_dtype == torch.half
+    param_names = {param: name for name, param in model_context.model.named_parameters()}
+    pg = parallel_group("zero") or parallel_group("data")
+
+    ds_dist.init_distributed(dist_backend="nccl", dist_init_required=None)
+
+    model_context.optim = DeepSpeedZeroOptimizer(
+        model_context.optim, param_names, timers=NoopTimer(), dp_process_group=pg, **ds_optim_config
+    )
+
+    model_context.args["use_optim_backward"] = True
+    model_context.args["requires_set_gradient_accumulation_boundary"] = True
+    if zero2:
+        # call optim.overlapping_partition_gradients_reduce_epilogue() after optim.backward()
+        def new_backward(self, loss, ori_backward, *args, **kargs):
+            ori_backward(loss, *args, **kargs)
+            self.overlapping_partition_gradients_reduce_epilogue()
+
+        model_context.optim.backward = types.MethodType(
+            partial(new_backward, ori_backward=model_context.optim.backward), model_context.optim
+        )
+    else:  # zero1
+        # call optim.reduce_gradients() before optim.step()
+        def new_step(self, ori_step, *args, **kargs):
+            self.is_gradient_accumulation_boundary = True
+            self.reduce_gradients()
+            ori_step(*args, **kargs)
+
+        model_context.optim.step = types.MethodType(
+            partial(new_step, ori_step=model_context.optim.step), model_context.optim
+        )
+
+    def set_gradient_accumulation_boundary(self, is_boundary=True):
+        self.is_gradient_accumulation_boundary = is_boundary
+
+    model_context.optim.set_gradient_accumulation_boundary = types.MethodType(
+        set_gradient_accumulation_boundary, model_context.optim
+    )
+
+    return model_context

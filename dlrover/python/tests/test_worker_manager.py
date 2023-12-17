@@ -1,4 +1,4 @@
-# Copyright 2022 The EasyDL Authors. All rights reserved.
+# Copyright 2022 The DLRover Authors. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -100,11 +100,14 @@ class WorkerManagerTest(unittest.TestCase):
             self._elastic_job.get_node_service_addr,
             self._elastic_job.get_node_name,
         )
+        failed_worker = self._job_nodes[NodeType.WORKER][4]
+        failed_worker.status = NodeStatus.FAILED
         plan = worker_manager.relaunch_node(
-            self._job_nodes[NodeType.WORKER][4]
+            failed_worker, remove_exited_node=True
         )
         self.assertEqual(plan.launch_nodes[0].config_resource.cpu, 16)
         self.assertEqual(worker_manager._nodes[5].id, 5)
+        self.assertEqual(plan.remove_nodes[0].config_resource.cpu, 16)
 
     def test_relaunch_chief_node(self):
         tf_master_node = Node(
@@ -137,6 +140,12 @@ class WorkerManagerTest(unittest.TestCase):
         plan = worker_manager.reduce_pending_node_resource()
         self.assertEqual(len(plan.launch_nodes), 5)
 
+        for node in worker_manager._nodes.values():
+            node.config_resource.gpu_num = 1
+
+        plan = worker_manager.reduce_pending_node_resource()
+        self.assertTrue(plan.empty())
+
     def test_pending_without_workers(self):
         worker_manager = WorkerManager(
             self._job_nodes[NodeType.WORKER],
@@ -163,3 +172,20 @@ class WorkerManagerTest(unittest.TestCase):
 
         wait = worker_manager.wait_worker_restart()
         self.assertFalse(wait)
+
+    def test_verify_restarting_training(self):
+        worker_manager = WorkerManager(
+            self._job_nodes[NodeType.WORKER],
+            self._job_resource,
+            3,
+            self._elastic_job.get_node_service_addr,
+            self._elastic_job.get_node_name,
+        )
+        reset = worker_manager.verify_restarting_training(0)
+        self.assertFalse(reset)
+        worker_manager._nodes[0].restart_training = True
+        reset = worker_manager.verify_restarting_training(0)
+        self.assertTrue(reset)
+        worker_manager._nodes[0].is_released = True
+        reset = worker_manager.verify_restarting_training(0)
+        self.assertFalse(reset)
